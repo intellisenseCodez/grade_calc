@@ -6,6 +6,8 @@
 API_KEY=$(API_KEY)
 PASSWORD=$(PASSWORD)
 
+# a chamge
+
 
 echo $API_KEY
 
