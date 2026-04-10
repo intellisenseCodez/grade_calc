@@ -4,9 +4,7 @@
 
 
 API_KEY=$(API_KEY)
-MY_PASSWORD=$(PASSWORD)
-
-# a chamge
+REPO_PASSWORD=$(PASSWORD)
 
 
 echo $API_KEY
