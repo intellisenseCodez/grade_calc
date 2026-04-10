@@ -4,7 +4,7 @@
 
 
 API_KEY=$(API_KEY)
-PASSWORD=$(PASSWORD)
+DB_PASSWORD=$(PASSWORD)
 
 # a chamge
 
