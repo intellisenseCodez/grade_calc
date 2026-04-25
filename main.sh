@@ -3,7 +3,7 @@
 # read the .env file
 
 
-API_KEY=$(API_KEY)
+API_KEY_SECRETE=$(API_KEY)
 REPO_PASSWORD=$(PASSWORD)
 
 
