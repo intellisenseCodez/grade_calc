@@ -1,0 +1,338 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+  FRONTEND_IMAGE: flask-app/frontend
+  BACKEND_IMAGE: flask-app/backend
+  POSTGRES_IMAGE: flask-app/postgres
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1 — Lint & unit tests
+  # ─────────────────────────────────────────────
+  test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r backend/requirements.txt
+          pip install flake8 black pytest pytest-cov
+
+      - name: Lint with flake8
+        run: flake8 backend/ --max-line-length=120 --exclude=migrations/
+
+      - name: Check formatting with black
+        run: black --check backend/
+
+      - name: Run unit tests
+        run: |
+          cd backend
+          pytest tests/unit/ -v --cov=app --cov-report=xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: backend/coverage.xml
+
+  # ─────────────────────────────────────────────
+  # JOB 2 — Integration tests (docker compose)
+  # ─────────────────────────────────────────────
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start services
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Run integration tests
+        run: |
+          docker compose -f docker-compose.test.yml exec -T backend \
+            pytest tests/integration/ -v
+
+      - name: Tear down services
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  # ─────────────────────────────────────────────
+  # JOB 3 — Security scan
+  # ─────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # ─────────────────────────────────────────────
+  # JOB 4 — Build & push images to ECR
+  # ─────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: [integration-test, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Image tag: ${SHORT_SHA}"
+
+      - name: Build & push frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.FRONTEND_IMAGE }}:latest
+            ${{ env.ECR_REGISTRY }}/${{ env.FRONTEND_IMAGE }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=registry,ref=${{ env.ECR_REGISTRY }}/${{ env.FRONTEND_IMAGE }}:latest
+          cache-to: type=inline
+
+      - name: Build & push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest
+            ${{ env.ECR_REGISTRY }}/${{ env.BACKEND_IMAGE }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=registry,ref=${{ env.ECR_REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest
+          cache-to: type=inline
+
+      - name: Tag & push pinned PostgreSQL image
+        run: |
+          docker pull postgres:16
+          docker tag postgres:16 ${{ env.ECR_REGISTRY }}/${{ env.POSTGRES_IMAGE }}:16
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.POSTGRES_IMAGE }}:16
+
+      - name: Notify ECR push via SNS
+        run: |
+          aws sns publish \
+            --topic-arn ${{ secrets.SNS_TOPIC_ARN }} \
+            --subject "New images pushed to ECR" \
+            --message "Commit ${{ steps.meta.outputs.tag }} — frontend, backend images pushed to ECR by ${{ github.actor }}. Repo: ${{ github.repository }}"
+
+  # ─────────────────────────────────────────────
+  # JOB 5 — Deploy
+  # ─────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Option A: docker compose on EC2 ──────
+      # Comment out Option B below if using this approach.
+      - name: Deploy via SSH to EC2
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /opt/flask-app
+
+            # Pull latest images
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+              docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+            export IMAGE_TAG=${{ needs.build-and-push.outputs.image-tag }}
+            export ECR_REGISTRY=${{ env.ECR_REGISTRY }}
+            export FRONTEND_IMAGE=${{ env.FRONTEND_IMAGE }}
+            export BACKEND_IMAGE=${{ env.BACKEND_IMAGE }}
+            export POSTGRES_IMAGE=${{ env.POSTGRES_IMAGE }}
+
+            docker compose pull
+            
+            # Run DB migrations before swapping containers
+            docker compose run --rm backend flask db upgrade
+
+            # Blue-green swap: bring up new containers, remove old
+            docker compose up -d --remove-orphans
+
+            # Prune dangling images to save disk
+            docker image prune -f
+
+      # ── Option B: ECS (uncomment to use) ─────
+      # - name: Update ECS task definition — backend
+      #   id: task-def-backend
+      #   uses: aws-actions/amazon-ecs-render-task-definition@v1
+      #   with:
+      #     task-definition: ecs/task-definition.json
+      #     container-name: backend
+      #     image: ${{ env.ECR_REGISTRY }}/${{ env.BACKEND_IMAGE }}:${{ needs.build-and-push.outputs.image-tag }}
+      #
+      # - name: Deploy to ECS
+      #   uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      #   with:
+      #     task-definition: ${{ steps.task-def-backend.outputs.task-definition }}
+      #     service: flask-app-service
+      #     cluster: flask-app-cluster
+      #     wait-for-service-stability: true
+
+  # ─────────────────────────────────────────────
+  # JOB 6 — Health checks
+  # ─────────────────────────────────────────────
+  health-check:
+    name: Health Check
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    steps:
+      - name: Wait for services to stabilise
+        run: sleep 20
+
+      - name: Check frontend health
+        run: |
+          for i in {1..5}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              http://${{ secrets.APP_HOST }}/health)
+            echo "Attempt $i — frontend: $STATUS"
+            [ "$STATUS" -eq 200 ] && break
+            [ "$i" -eq 5 ] && echo "Frontend health check failed" && exit 1
+            sleep 10
+          done
+
+      - name: Check backend health
+        run: |
+          for i in {1..5}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              http://${{ secrets.APP_HOST }}/api/health)
+            echo "Attempt $i — backend: $STATUS"
+            [ "$STATUS" -eq 200 ] && break
+            [ "$i" -eq 5 ] && echo "Backend health check failed" && exit 1
+            sleep 10
+          done
+
+  # ─────────────────────────────────────────────
+  # JOB 7 — Notify success
+  # ─────────────────────────────────────────────
+  notify-success:
+    name: Notify — Success
+    runs-on: ubuntu-latest
+    needs: health-check
+    if: success()
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Publish success notification to SNS
+        run: |
+          aws sns publish \
+            --topic-arn ${{ secrets.SNS_TOPIC_ARN }} \
+            --subject "Deployment succeeded — ${{ github.repository }}" \
+            --message "✅ Deployment successful.\n\nCommit: ${{ github.sha }}\nTag: ${{ needs.build-and-push.outputs.image-tag }}\nBranch: ${{ github.ref_name }}\nTriggered by: ${{ github.actor }}\nWorkflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  # ─────────────────────────────────────────────
+  # JOB 8 — Notify failure & rollback
+  # ─────────────────────────────────────────────
+  notify-failure:
+    name: Notify — Failure & Rollback
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy, health-check]
+    if: failure()
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Rollback to previous image on EC2
+        uses: appleboy/ssh-action@v1
+        continue-on-error: true
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /opt/flask-app
+            # Re-export the previous tag stored during last successful deploy
+            export IMAGE_TAG=$(cat .last_stable_tag 2>/dev/null || echo "latest")
+            echo "Rolling back to image tag: $IMAGE_TAG"
+            docker compose up -d --remove-orphans
+
+      - name: Publish failure notification to SNS
+        run: |
+          aws sns publish \
+            --topic-arn ${{ secrets.SNS_TOPIC_ARN }} \
+            --subject "⚠️ Deployment FAILED — ${{ github.repository }}" \
+            --message "Deployment failed and rollback was attempted.\n\nCommit: ${{ github.sha }}\nBranch: ${{ github.ref_name }}\nTriggered by: ${{ github.actor }}\nWorkflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
